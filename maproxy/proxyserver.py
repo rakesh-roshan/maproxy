@@ -13,6 +13,7 @@ class ProxyServer(tornado.tcpserver.TCPServer):
     """
     def __init__(self,
                  target_server,target_port,
+                 secondary_target_server, secondary_target_port,
                  client_ssl_options=None,server_ssl_options=None,
                  session_factory=maproxy.session.SessionFactory(),
                  *args,**kwargs):
@@ -34,18 +35,20 @@ class ProxyServer(tornado.tcpserver.TCPServer):
         assert(session_factory , issubclass(session_factory.__class__,maproxy.session.SessionFactory))
         self.session_factory=session_factory
 
-        
-        # First, get the server's address and port . 
+
+        # First, get the server's address and port .
         # This is the proxied server that we'll connect to
         self.target_server=target_server
         self.target_port=target_port
-        
+        self.secondary_target_server = secondary_target_server
+        self.secondary_target_port = secondary_target_port
+
         # Now, remember the SSL potions
         # client_ssl_options : use it if you want an SSL listener (if you want that the proxy will have an SSL listener)
         # server_ssl_options:  use it if you want an SSL connection to the proxy server (if your target server is SSL)
         self.client_ssl_options=client_ssl_options
         self.server_ssl_options=server_ssl_options
-        
+
         # Nromalize SSL options:
         # If the server is SSL, the tornado expects a dictionary, so let's change the True to {}
         # If the caller provided "ssl=False", we need to make it None
@@ -58,13 +61,13 @@ class ProxyServer(tornado.tcpserver.TCPServer):
 
         # Session-List
         self.SessionsList=[]
-        
+
         # call Tornado's Engine . pass args/kwargs directly
         super(ProxyServer,self).__init__(ssl_options=self.client_ssl_options,*args,**kwargs)
-        
-    
-        
-        
+
+
+
+
     def handle_stream(self, stream, address):
         """
         The proxy will call this function for every new connection as a callback
