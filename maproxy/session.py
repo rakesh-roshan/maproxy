@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 
 import threading
-import tornado
+import logging
 import socket
+
+import tornado
 import maproxy.proxyserver
 
 
@@ -44,12 +46,12 @@ class Session(object):
         # Log charactaristics
         LOG_SESSION_ID=True         # for each log, add the session-id
         # Log different operations
-        LOG_NEW_SESSION_OP=False
-        LOG_READ_OP=False
-        LOG_WRITE_OP=False
-        LOG_CLOSE_OP=False
-        LOG_CONNECT_OP=False
-        LOG_REMOVE_SESSION=False
+        LOG_NEW_SESSION_OP=True
+        LOG_READ_OP=True
+        LOG_WRITE_OP=True
+        LOG_CLOSE_OP=True
+        LOG_CONNECT_OP=True
+        LOG_REMOVE_SESSION=True
 
     class State:
         """
