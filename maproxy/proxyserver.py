@@ -12,8 +12,7 @@ class ProxyServer(tornado.tcpserver.TCPServer):
 
     """
     def __init__(self,
-                 target_server,target_port,
-                 secondary_target_server, secondary_target_port,
+                 targets,
                  client_ssl_options=None,server_ssl_options=None,
                  session_factory=maproxy.session.SessionFactory(),
                  *args,**kwargs):
@@ -38,10 +37,10 @@ class ProxyServer(tornado.tcpserver.TCPServer):
 
         # First, get the server's address and port .
         # This is the proxied server that we'll connect to
-        self.target_server=target_server
-        self.target_port=target_port
-        self.secondary_target_server = secondary_target_server
-        self.secondary_target_port = secondary_target_port
+        self.targets = targets
+
+        self.num_targets = len(targets)
+        assert(self.num_targets <= 10)   # Support 10 targets
 
         # Now, remember the SSL potions
         # client_ssl_options : use it if you want an SSL listener (if you want that the proxy will have an SSL listener)
@@ -81,7 +80,7 @@ class ProxyServer(tornado.tcpserver.TCPServer):
 
     def remove_session(self,session):
         assert (  isinstance(session, maproxy.session.Session) )
-        assert ( session.p2s_state==maproxy.session.Session.State.CLOSED )
+        assert ( all([state == maproxy.session.Session.State.CLOSED for state in session.p2s_state]))
         assert ( session.c2p_state ==maproxy.session.Session.State.CLOSED )
         self.SessionsList.remove(session)
         self.session_factory.delete(session)

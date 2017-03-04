@@ -1,29 +1,25 @@
 #!/usr/bin/env python
 import argparse
+import collections
 import logging
-import maproxy.proxyserver
 import sys
+
+import maproxy.proxyserver
 import tornado.ioloop
 
-
-
+AddressPort = collections.namedtuple('AddressPort', ['address', 'port'])
 
 def parse_args():
     arg_parser = argparse.ArgumentParser(description='Starts a Proxy server')
-    arg_parser.add_argument('--server1',
+    arg_parser.add_argument('--primary',
                             help='Primary Server',
+                            type=address_port,
                             required=True)
-    arg_parser.add_argument('--port1',
-                            help='Primary Port',
-                            type=int,
-                            required=True)
-    arg_parser.add_argument('--server2',
-                            help='Secnodary Server',
-                            required=True)
-    arg_parser.add_argument('--port2',
-                            help='Secnodary Port',
-                            type=int,
-                            required=True)
+    arg_parser.add_argument('--secondary',
+                            help='Secondary Server',
+                            type=address_port,
+                            default=[],
+                            action='append')
     arg_parser.add_argument('--listen-port',
                             help='Listen Port',
                             type=int,
@@ -39,24 +35,32 @@ def parse_args():
 def setup_logging(debug=False):
     log_format = '%(asctime)s %(message)s'
     log_level = logging.INFO
-    print(debug)
     if debug:
         log_level = logging.DEBUG
 
     logging.basicConfig(level=log_level, format=log_format)
     logging.debug('Logging Set to level DEBUG')
 
+
+def address_port(s):
+    address, port = s.split(':')
+    if not address or not port:
+        raise argparse.TypeError()
+    return AddressPort(address=address, port=int(port))
+
+
 def main():
     opts = parse_args()
     setup_logging(opts.verbose)
 
-    server = maproxy.proxyserver.ProxyServer(opts.server1,
-                                             opts.port1,
-                                             opts.server2,
-                                             opts.port2)
+    server = maproxy.proxyserver.ProxyServer([opts.primary] + opts.secondary)
     server.listen(opts.listen_port, opts.listen_address)
-    print("%s:%s -> %s->%s" % (opts.listen_address, opts.listen_port, opts.server1, opts.port1))
-    print("%s:%s -> %s->%s" % (opts.listen_address, opts.listen_port, opts.server2, opts.port2))
+    print("Primary: %s:%s -> %s->%s" % (opts.listen_address, opts.listen_port,
+                                        opts.primary.address, opts.primary.port))
+    for target in opts.secondary:
+        print("%s:%s -> %s->%s" % (opts.listen_address, opts.listen_port,
+                                   target.address, target.port))
+
     tornado.ioloop.IOLoop.instance().start()
 
 

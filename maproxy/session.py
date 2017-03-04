@@ -7,6 +7,10 @@ import socket
 import tornado
 import maproxy.proxyserver
 
+from functools import partial
+
+import tornado
+import maproxy.proxyserver
 
 
 class Session(object):
@@ -84,15 +88,24 @@ class Session(object):
             #       c2p means the socket from the client to the proxy
             #       p2s means the socket from the proxy to the server
             self.c2p_reading=False  # whether we're reading from the client
-            self.c2p_writing=False  # whether we're writing to the client
-            self.c2p_secondary_writing=False  # whether we're writing to the client
-            self.p2s_writing=False  # whether we're writing to the server
-            self.p2s_reading=False  # whether we're reading from the server
+            self.c2p_writing=[]  # whether we're writing to the client
+
+            self.p2s_writing=[]  # whether we're writing to the server
+            self.p2s_reading=[]  # whether we're reading from the server
+            self.p2s_state=[]
+
+            for target_num in range(self.proxy.num_targets):
+                self.c2p_writing.append(False)
+                self.p2s_writing.append(False)
+                self.p2s_reading.append(False)
+                self.p2s_state.append(Session.State.CLOSED)
+
             self.p2s_secondary_writing=False  # whether we're writing to the secondary server
             self.p2s_secondary_reading=False  # whether we're reading from the secondary server
             self.session_removed=False
 
             self.c2p_lock = threading.Lock()
+            self.p2s_lock = threading.Lock()
             # Init the Client->Proxy stream
             self.c2p_stream=stream
             self.c2p_address=address
@@ -102,8 +115,12 @@ class Session(object):
             # Here we will put incoming data while we're still waiting for the target-server's connection
             self.c2s_queued_data=[] # Data that was read from the Client, and needs to be sent to the  Server
             self.s2c_queued_data=[] # Data that was read from the Server , and needs to be sent to the  client
-            self.c2s_secondary_queued_data=[] # Data that was read from the Client, and needs to be sent to the  Server
-            self.s2c_secondary_queued_data=[] # Data that was read from the Server , and needs to be sent to the  client
+            for target_num in range(self.proxy.num_targets):
+                # Data that was read from the Client, and needs to be sent to the  Server
+                self.c2s_queued_data.append([])
+
+                # Data that was read from the Server , and needs to be sent to the  client
+                self.s2c_queued_data.append([])
 
             # send data immediately to the client ... (Disable Nagle TCP algorithm)
             self.c2p_stream.set_nodelay(True)
@@ -111,31 +128,37 @@ class Session(object):
             self.c2p_stream.set_close_callback( self.on_c2p_close)
 
             # Create the Proxy->Server socket and stream
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
-            s_secondary = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+            server_connections = []
+            for target_num in range(self.proxy.num_targets):
+                server_connections.append(socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0))
+
+            self.p2s_stream = []
 
             if self.proxy.server_ssl_options is not None:
                 # if the "server_ssl_options" where specified, it means that when we connect, we need to wrap with SSL
                 # so we need to use the SSLIOStream stream
-                self.p2s_stream = tornado.iostream.SSLIOStream(s,ssl_options=self.proxy.server_ssl_options)
-                self.p2s_secondary_stream = tornado.iostream.SSLIOStream(s_secondary,ssl_options=self.proxy.server_ssl_options)
+                for target_num in range(self.proxy.num_targets):
+                    self.p2s_stream.append(tornado.iostream.SSLIOStream(server_connections[target_num],
+                                                                        ssl_options=self.proxy.server_ssl_options))
             else:
                 # use the standard IOStream stream
-                self.p2s_stream = tornado.iostream.IOStream(s)
-                self.p2s_secondary_stream = tornado.iostream.IOStream(s_secondary)
-            # send data immediately to the server... (Disable Nagle TCP algorithm)
-            self.p2s_stream.set_nodelay(True)
-            self.p2s_secondary_stream.set_nodelay(True)
+                for target_num in range(self.proxy.num_targets):
+                    self.p2s_stream.append(tornado.iostream.IOStream(server_connections[target_num]))
 
-            # Let us now when the server disconnects (callback on_p2s_close)
-            self.p2s_stream.set_close_callback(  self.on_p2s_close )
-            self.p2s_secondary_stream.set_close_callback(  self.on_p2s_secondary_close )
-            # P->S state is "connecting"
-            self.p2s_state=self.p2s_state=Session.State.CONNECTING
-            self.p2s_secondary_state = Session.State.CONNECTING
-            self.p2s_stream.connect(( proxy.target_server, proxy.target_port),  self.on_p2s_done_connect )
-            self.p2s_secondary_stream.connect(( proxy.secondary_target_server, proxy.secondary_target_port),  self.on_p2s_secondary_done_connect )
+            for target_num in range(self.proxy.num_targets):
+                # send data immediately to the server... (Disable Nagle TCP algorithm)
+                self.p2s_stream[target_num].set_nodelay(True)
 
+                on_p2s_close = partial(self.on_p2s_close_n, target_num=target_num)
+                self.p2s_stream[target_num].set_close_callback( on_p2s_close )
+
+                # P->S state is "connecting"
+                self.p2s_state[target_num]=Session.State.CONNECTING
+                on_p2s_done_connect = partial(self.on_p2s_done_connect_n, target_num=target_num)
+                target = self.proxy.targets[target_num]
+
+                self.p2s_stream[target_num].connect((target.address, target.port),
+                                                    on_p2s_done_connect )
 
             # We can actually start reading immediatelly from the C->P socket
             self.c2p_start_read()
@@ -191,28 +214,17 @@ class Session(object):
             self.c2p_reading=False
 
     @logger(LoggerOptions.LOG_READ_OP)
-    def p2s_start_read(self):
+    def p2s_start_read_n(self, target_num):
         """
         Start read from server
         """
-        assert( not self.p2s_reading)
-        self.p2s_reading=True
+        assert( not self.p2s_reading[target_num])
+        self.p2s_reading[target_num] = True
         try:
-            self.p2s_stream.read_until_close(lambda x:None,self.on_p2s_done_read)
+            on_p2s_done_read = partial(self.on_p2s_done_read_n, target_num=target_num)
+            self.p2s_stream[target_num].read_until_close(lambda x:None, on_p2s_done_read)
         except tornado.iostream.StreamClosedError:
-            self.p2s_reading=False
-
-    @logger(LoggerOptions.LOG_READ_OP)
-    def p2s_secondary_start_read(self):
-        """
-        Start read from secondary server
-        """
-        assert( not self.p2s_secondary_reading)
-        self.p2s_secondary_reading=True
-        try:
-            self.p2s_secondary_stream.read_until_close(lambda x:None,self.on_p2s_secondary_done_read)
-        except tornado.iostream.StreamClosedError:
-            self.p2s_secondary_reading=False
+            self.p2s_reading[target_num] = False
 
 
     ##############################
@@ -223,30 +235,22 @@ class Session(object):
         # # We got data from the client (C->P ) . Send data to the server
         assert(self.c2p_reading)
         assert(data)
-        self.p2s_start_write(data)
-        self.p2s_secondary_start_write(data)
-
+        for target_num in range(self.proxy.num_targets):
+            self.p2s_start_write_n(target_num=target_num, data=data)
 
     @logger(LoggerOptions.LOG_READ_OP)
-    def on_p2s_done_read(self,data):
+    def on_p2s_done_read_n(self, data, target_num):
         # got data from Server to Proxy . if the client is still connected - send the data to the client
-        assert( self.p2s_reading)
+        assert( self.p2s_reading[target_num])
         assert(data)
-        self.c2p_start_write(data)
-
-    @logger(LoggerOptions.LOG_READ_OP)
-    def on_p2s_secondary_done_read(self,data):
-        # got data from Secondary Server to Proxy . if the client is still connected - send the data to the client
-        assert( self.p2s_secondary_reading)
-        assert(data)
-        self.c2p_secondary_start_write(data)
+        self.c2p_start_write_n(target_num=target_num, data=data)
 
 
     #####################
     ## Write to stream ##
     #####################
     @logger(LoggerOptions.LOG_WRITE_OP)
-    def _c2p_io_write(self,data):
+    def _c2p_io_write_n(self, data, target_num):
         self.c2p_lock.acquire()
         if data is None:
             # None means (gracefully) close-socket  (a "close request" that was queued...)
@@ -254,119 +258,64 @@ class Session(object):
             try:
                 self.c2p_stream.close()
             except tornado.iostream.StreamClosedError:
-                self.c2p_writing=False
+                self.c2p_writing[target_num] = False
             finally:
                 self.c2p_lock.release()
         else:
-            self.c2p_writing=True
+            self.c2p_writing[target_num] = True
             try:
-                self.c2p_stream.write(data,callback=self.on_c2p_done_write)
+                # on_c2p_done_write = partial(self.on_c2p_done_write_n, target_num=target_num)
+                self.c2p_stream.write(data, callback=self.on_c2p_done_write)
             except tornado.iostream.StreamClosedError:
                 # Cancel the write, we will get on_close instead...
-                self.c2p_writing=False
+                self.c2p_writing[target_num] = False
             finally:
                 self.c2p_lock.release()
 
     @logger(LoggerOptions.LOG_WRITE_OP)
-    def _c2p_secondary_io_write(self,data):
-        self.c2p_lock.acquire()
+    def _p2s_io_write_n(self, data, target_num):
         if data is None:
             # None means (gracefully) close-socket  (a "close request" that was queued...)
-            self.c2p_state=Session.State.CLOSED
-            try:
-                self.c2p_stream.close()
-            except tornado.iostream.StreamClosedError:
-                self.c2p_secondary_writing=False
-            finally:
-                self.c2p_lock.release()
+            with self.p2s_lock:
+                self.p2s_state[target_num] = Session.State.CLOSED
+                try:
+                    self.p2s_stream[target_num].close()
+                except tornado.iostream.StreamClosedError:
+                    # Cancel the write. we will get on_close instead
+                    self.p2s_writing[target_num] = False
         else:
-            self.c2p_secondary_writing=True
+            self.p2s_writing[target_num] = True
             try:
-                self.c2p_stream.write(data,callback=self.on_c2p_done_write)
-            except tornado.iostream.StreamClosedError:
-                # Cancel the write, we will get on_close instead...
-                self.c2p_secondary_writing=False
-            finally:
-                self.c2p_lock.release()
-
-    @logger(LoggerOptions.LOG_WRITE_OP)
-    def _p2s_io_write(self,data):
-        if data is None:
-            # None means (gracefully) close-socket  (a "close request" that was queued...)
-            self.p2s_state=Session.State.CLOSED
-            try:
-                self.p2s_stream.close()
+                on_p2s_done_write = partial(self.on_p2s_done_write_n, target_num=target_num)
+                self.p2s_stream[target_num].write(data, callback=on_p2s_done_write)
             except tornado.iostream.StreamClosedError:
                 # Cancel the write. we will get on_close instead
-                self.p2s_writing=False
-        else:
-            self.p2s_writing=True
-            try:
-                self.p2s_stream.write(data,callback=self.on_p2s_done_write)
-            except tornado.iostream.StreamClosedError:
-                # Cancel the write. we will get on_close instead
-                self.p2s_writing=False
-
-    @logger(LoggerOptions.LOG_WRITE_OP)
-    def _p2s_secondary_io_write(self,data):
-        if data is None:
-            # None means (gracefully) close-socket  (a "close request" that was queued...)
-            self.p2s_secondary_state=Session.State.CLOSED
-            try:
-                self.p2s_secondary_stream.close()
-            except tornado.iostream.StreamClosedError:
-                # Cancel the write. we will get on_close instead
-                self.p2s_secondary_writing=False
-        else:
-            self.p2s_secondary_writing=True
-            try:
-                self.p2s_secondary_stream.write(data,callback=self.on_p2s_secondary_done_write)
-            except tornado.iostream.StreamClosedError:
-                # Cancel the write. we will get on_close instead
-                self.p2s_secondary_writing=False
+                self.p2s_writing[target_num] = False
 
 
     #################
     ## Start Write ##
     #################
     @logger(LoggerOptions.LOG_WRITE_OP)
-    def c2p_start_write(self,data):
+    def c2p_start_write_n(self, data, target_num):
         """
         Write to client.if there's a pending write-operation, add it to the S->C (s2c) queue
         """
         # If not connected - do nothing...
         if self.c2p_state != Session.State.CONNECTED: return
 
-        if not self.c2p_writing and not self.c2p_secondary_writing :
+        if not any(self.c2p_writing):
             # If we're not currently writing
-            assert( not self.s2c_queued_data ) # we expect the  queue to be empty
+            assert( not self.s2c_queued_data[target_num] ) # we expect the  queue to be empty
 
             # Start the "real" write I/O operation
-            self._c2p_io_write(data)
+            self._c2p_io_write_n(target_num=target_num, data=data)
         else:
             # Just add to the queue
-            self.s2c_queued_data.append(data)
+            self.s2c_queued_data[target_num].append(data)
 
     @logger(LoggerOptions.LOG_WRITE_OP)
-    def c2p_secondary_start_write(self,data):
-        """
-        Write to client.if there's a pending write-operation, add it to the S->C (s2c) queue
-        """
-        # If not connected - do nothing...
-        if self.c2p_state != Session.State.CONNECTED: return
-
-        if not self.c2p_secondary_writing and not self.c2p_writing:
-            # If we're not currently writing
-            assert( not self.s2c_secondary_queued_data ) # we expect the  queue to be empty
-
-            # Start the "real" write I/O operation
-            self._c2p_secondary_io_write(data)
-        else:
-            # Just add to the queue
-            self.s2c_secondary_queued_data.append(data)
-
-    @logger(LoggerOptions.LOG_WRITE_OP)
-    def p2s_start_write(self,data):
+    def p2s_start_write_n(self, data, target_num):
         """
         Write to the server.
         If not connected yet - queue the data
@@ -374,44 +323,20 @@ class Session(object):
         """
 
         # If still connecting to the server - queue the data...
-        if self.p2s_state == Session.State.CONNECTING:
-            self.c2s_queued_data.append(data)   # TODO: is it better here to append (to list) or concatenate data (to buffer) ?
+        if self.p2s_state[target_num] == Session.State.CONNECTING:
+            self.c2s_queued_data[target_num].append(data)   # TODO: is it better here to append (to list) or concatenate data (to buffer) ?
             return
         # If not connected - do nothing
-        if self.p2s_state == Session.State.CLOSED:
+        if self.p2s_state[target_num] == Session.State.CLOSED:
             return
-        assert(self.p2s_state == Session.State.CONNECTED)
+        assert(self.p2s_state[target_num] == Session.State.CONNECTED)
 
-        if not self.p2s_writing:
+        if not self.p2s_writing[target_num]:
             # Start the "real" write I/O operation
-            self._p2s_io_write(data)
+            self._p2s_io_write_n(target_num=target_num, data=data)
         else:
             # Just add to the queue
-            self.c2s_queued_data.append(data)
-
-    @logger(LoggerOptions.LOG_WRITE_OP)
-    def p2s_secondary_start_write(self,data):
-        """
-        Write to the server.
-        If not connected yet - queue the data
-        If there's a pending write-operation , add it to the C->S (c2s) queue
-        """
-
-        # If still connecting to the server - queue the data...
-        if self.p2s_secondary_state == Session.State.CONNECTING:
-            self.c2s_secondary_queued_data.append(data)   # TODO: is it better here to append (to list) or concatenate data (to buffer) ?
-            return
-        # If not connected - do nothing
-        if self.p2s_secondary_state == Session.State.CLOSED:
-            return
-        assert(self.p2s_secondary_state == Session.State.CONNECTED)
-
-        if not self.p2s_secondary_writing:
-            # Start the "real" write I/O operation
-            self._p2s_secondary_io_write(data)
-        else:
-            # Just add to the queue
-            self.c2s_secondary_queued_data.append(data)
+            self.c2s_queued_data[target_num].append(data)
 
 
     ##############################
@@ -423,49 +348,30 @@ class Session(object):
         A start_write C->P  (write to client) is done .
         if there is queued-data to send - send it
         """
-        assert(self.c2p_writing or self.c2p_secondary_writing)
-        while(self.s2c_queued_data or self.s2c_secondary_queued_data):
-            if self.s2c_queued_data:
-                # more data in the queue, write next item as well..
-                self._c2p_io_write( self.s2c_queued_data.pop(0))
-                return
-            self.c2p_writing=False
-            if self.s2c_secondary_queued_data:
-                # more data in the queue, write next item as well..
-                self._c2p_secondary_io_write( self.s2c_secondary_queued_data.pop(0))
-                return
-            self.c2p_secondary_writing=False
+        assert(any([writing for writing in self.c2p_writing]))
 
-        self.c2p_secondary_writing=False
-        self.c2p_writing=False
+        for target_num in range(self.proxy.num_targets):
+            queued_data = self.s2c_queued_data[target_num]
+            if not queued_data:
+                self.c2p_writing[target_num] = False
+                continue
+            self._c2p_io_write_n(target_num=target_num, data=queued_data.pop(0))
+            return
 
 
     @logger(LoggerOptions.LOG_WRITE_OP)
-    def on_p2s_done_write(self):
+    def on_p2s_done_write_n(self, target_num):
         """
         A start_write P->S  (write to server) is done .
         if there is queued-data to send - send it
         """
-        assert(self.p2s_writing)
-        if self.c2s_queued_data:
+        assert(self.p2s_writing[target_num])
+        queued_data = self.c2s_queued_data[target_num]
+        if queued_data:
             # more data in the queue, write next item as well..
-            self._p2s_io_write( self.c2s_queued_data.pop(0))
+            self._p2s_io_write_n( target_num=target_num, data=queued_data.pop(0))
             return
-        self.p2s_writing=False
-
-
-    @logger(LoggerOptions.LOG_WRITE_OP)
-    def on_p2s_secondary_done_write(self):
-        """
-        A start_write P->S  (write to server) is done .
-        if there is queued-data to send - send it
-        """
-        assert(self.p2s_secondary_writing)
-        if self.c2s_secondary_queued_data:
-            # more data in the queue, write next item as well..
-            self._p2s_secondary_io_write( self.c2s_secondary_queued_data.pop(0))
-            return
-        self.p2s_secondary_writing=False
+        self.p2s_writing[target_num]=False
 
 
 
@@ -486,20 +392,19 @@ class Session(object):
         if self.c2p_state == Session.State.CLOSED:
             return
         if gracefully:
-            self.c2p_start_write(None)
+            self.c2p_start_write_n(target_num=0, data=None) # Primary is always present
             return
 
         self.c2p_state = Session.State.CLOSED
-        self.s2c_queued_data=[]
+        for target_num in range(self.proxy.num_targets):
+            self.s2c_queued_data[target_num]=[]
         self.s2c_secondary_queued_data=[]
         self.c2p_stream.close()
-        if (self.p2s_state == Session.State.CLOSED and
-            self.p2s_secondary_state == Session.State.CLOSED):
-            self.remove_session()
+        self.remove_session()
 
 
     @logger(LoggerOptions.LOG_CLOSE_OP)
-    def p2s_start_close(self,gracefully=True):
+    def p2s_start_close_n(self, target_num, gracefully=True):
         """
         Close p->s connection
         if gracefully is True then we simply add None to the queue, and start a write-operation
@@ -509,43 +414,16 @@ class Session(object):
             - if the other side (p->s) already closed, remove the session
 
         """
-        if self.p2s_state == Session.State.CLOSED:
+        if self.p2s_state[target_num] == Session.State.CLOSED:
             return
         if gracefully:
-            self.p2s_start_write(None)
+            self.p2s_start_write_n(target_num=target_num, data=None)
             return
 
-        self.p2s_state = Session.State.CLOSED
-        if self.p2s_secondary_state == Session.State.CLOSED:
-            self.c2s_queued_data=[]
+        self.p2s_state[target_num] = Session.State.CLOSED
+        self.c2s_queued_data[target_num]=[]
 
-        self.p2s_stream.close()
-        if self.c2p_state == Session.State.CLOSED:
-            self.remove_session()
-
-
-    @logger(LoggerOptions.LOG_CLOSE_OP)
-    def p2s_secondary_start_close(self,gracefully=True):
-        """
-        Close p->s connection
-        if gracefully is True then we simply add None to the queue, and start a write-operation
-        if gracefully is False then this is a "brutal" close:
-            - mark the stream is closed
-            - we "reset" (empty) the queued-data
-            - if the other side (p->s) already closed, remove the session
-
-        """
-        if self.p2s_secondary_state == Session.State.CLOSED:
-            return
-        if gracefully:
-            self.p2s_secondary_start_write(None)
-            return
-
-        self.p2s_secondary_state = Session.State.CLOSED
-
-        if self.p2s_state == Session.State.CLOSED:
-            self.c2s_queued_data=[]
-        self.p2s_secondary_stream.close()
+        self.p2s_stream[target_num].close()
         if self.c2p_state == Session.State.CLOSED:
             self.remove_session()
 
@@ -560,70 +438,49 @@ class Session(object):
         3. if p2s already closed - we can remove the session
         """
         self.c2p_state=Session.State.CLOSED
-        if (self.p2s_state == Session.State.CLOSED and
-            self.p2s_secondary_state == Session.State.CLOSED):
+        if all([state == Session.State.CLOSED for state in self.p2s_state]):
             self.remove_session()
         else:
-            self.p2s_start_close(gracefully=True)
-            self.p2s_secondary_start_close(gracefully=True)
+            for target_num in range(self.proxy.num_targets):
+                self.p2s_start_close_n(target_num, gracefully=True)
 
 
     @logger(LoggerOptions.LOG_CLOSE_OP)
-    def on_p2s_close(self):
+    def on_p2s_close_n(self, target_num):
         """
         Server closed the connection.
         We need to update the satte, and if the client closed as well - delete the session
         """
-        self.p2s_state=Session.State.CLOSED
-        if self.c2p_state == Session.State.CLOSED:
-            self.remove_session()
-        elif self.p2s_secondary_state == Session.State.CLOSED:
-            self.c2p_start_close(gracefully=True)
+        with self.p2s_lock:
+            self.p2s_state[target_num] = Session.State.CLOSED
+            if self.c2p_state == Session.State.CLOSED:
+                self.remove_session()
+            elif all([state == Session.State.CLOSED for state in self.p2s_state]):
+                self.c2p_start_close(gracefully=True)
+            elif target_num == 0: # Primary Target
+                self.c2p_start_close(gracefully=True)
 
-    @logger(LoggerOptions.LOG_CLOSE_OP)
-    def on_p2s_secondary_close(self):
-        """
-        Server closed the connection.
-        We need to update the satte, and if the client closed as well - delete the session
-        """
-        self.p2s_secondary_state=Session.State.CLOSED
-        if self.c2p_state == Session.State.CLOSED:
-            self.remove_session()
-        elif self.p2s_state == Session.State.CLOSED:
-            self.c2p_start_close(gracefully=True)
+
 
     ########################
     ## Connect-Completion ##
     ########################
     @logger(LoggerOptions.LOG_CONNECT_OP)
-    def on_p2s_done_connect(self):
-        assert(self.p2s_state==Session.State.CONNECTING)
-        self.p2s_state=Session.State.CONNECTED
-        # Start reading from the socket
-        self.p2s_start_read()
-        assert(not self.p2s_writing)    # As expect no current write-operation ...
+    def on_p2s_done_connect_n(self, target_num):
+        with self.p2s_lock:
+            assert(self.p2s_state[target_num]==Session.State.CONNECTING)
+            self.p2s_state[target_num]=Session.State.CONNECTED
+            # Start reading from the socket
+            self.p2s_start_read_n(target_num)
+            assert(not self.p2s_writing[target_num])    # As expect no current write-operation ...
 
-        # If we have pending-data to write, start writing...
-        if self.c2s_queued_data:
-            # TRICKY: get thte frst item , and write it...
-            # this is tricky since the "start-write" will
-            # write this item even if there are queued-items... (since self.p2s_writing=False)
-            self.p2s_start_write( self.c2s_queued_data.pop(0)  )
+            # If we have pending-data to write, start writing...
+            if self.c2s_queued_data[target_num]:
+                # TRICKY: get thte frst item , and write it...
+                # this is tricky since the "start-write" will
+                # write this item even if there are queued-items... (since self.p2s_writing=False)
+                self.p2s_start_write_n( target_num=target_num, data=self.c2s_queued_data[target_num].pop(0)  )
 
-    @logger(LoggerOptions.LOG_CONNECT_OP)
-    def on_p2s_secondary_done_connect(self):
-        assert(self.p2s_secondary_state==Session.State.CONNECTING)
-        self.p2s_secondary_state = Session.State.CONNECTED
-        # Start reading from the socket
-        self.p2s_secondary_start_read()
-        assert(not self.p2s_secondary_writing)    # As expect no current write-operation ...
-
-        # If we have pending-data to write, start writing...
-        if self.c2s_secondary_queued_data:
-            # TRICKY: get thte frst item , and write it...
-            # this is tricky since the "start-write" will
-            # write this item even if there are queued-items... (since self.p2s_writing=False)
-            self.p2s_secondary_start_write( self.c2s_secondary_queued_data.pop(0)  )
 
     ###########
     ## UTILS ##
@@ -631,8 +488,7 @@ class Session(object):
     @logger(LoggerOptions.LOG_REMOVE_SESSION)
     def remove_session(self):
         self.c2p_lock.acquire(timeout=600)
-        if (self.p2s_state == Session.State.CLOSED and
-            self.p2s_secondary_state == Session.State.CLOSED and
+        if (all([state == Session.State.CLOSED for state in self.p2s_state]) and
             self.c2p_state == Session.State.CLOSED and
             not self.session_removed):
 
