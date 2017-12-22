@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import logging
 import tornado
 import tornado.tcpserver
 import maproxy.session
@@ -77,6 +78,7 @@ class ProxyServer(tornado.tcpserver.TCPServer):
         session=self.session_factory.new()   # Use the factory to create new session
         session.new_connection(stream,address,self)
         self.SessionsList.append(session)
+        logging.info("New Connection: Total clients: %s", len(self.SessionsList))
 
     def remove_session(self,session):
         assert (  isinstance(session, maproxy.session.Session) )
@@ -84,6 +86,7 @@ class ProxyServer(tornado.tcpserver.TCPServer):
         assert ( session.c2p_state ==maproxy.session.Session.State.CLOSED )
         self.SessionsList.remove(session)
         self.session_factory.delete(session)
+        logging.info("Remove Connection: Total clients: %s", len(self.SessionsList))
 
     def get_connections_count(self):
         return len(self.SessionsList)
