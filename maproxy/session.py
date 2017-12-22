@@ -243,7 +243,8 @@ class Session(object):
         # got data from Server to Proxy . if the client is still connected - send the data to the client
         assert( self.p2s_reading[target_num])
         assert(data)
-        self.c2p_start_write_n(target_num=target_num, data=data)
+        if target_num == 0:
+            self.c2p_start_write_n(target_num=target_num, data=data)
 
 
     #####################
@@ -251,26 +252,22 @@ class Session(object):
     #####################
     @logger(LoggerOptions.LOG_WRITE_OP)
     def _c2p_io_write_n(self, data, target_num):
-        self.c2p_lock.acquire()
-        if data is None:
-            # None means (gracefully) close-socket  (a "close request" that was queued...)
-            self.c2p_state=Session.State.CLOSED
-            try:
-                self.c2p_stream.close()
-            except tornado.iostream.StreamClosedError:
-                self.c2p_writing[target_num] = False
-            finally:
-                self.c2p_lock.release()
-        else:
-            self.c2p_writing[target_num] = True
-            try:
-                # on_c2p_done_write = partial(self.on_c2p_done_write_n, target_num=target_num)
-                self.c2p_stream.write(data, callback=self.on_c2p_done_write)
-            except tornado.iostream.StreamClosedError:
-                # Cancel the write, we will get on_close instead...
-                self.c2p_writing[target_num] = False
-            finally:
-                self.c2p_lock.release()
+        with self.c2p_lock:
+            if data is None:
+                # None means (gracefully) close-socket  (a "close request" that was queued...)
+                self.c2p_state=Session.State.CLOSED
+                try:
+                    self.c2p_stream.close()
+                except tornado.iostream.StreamClosedError:
+                    self.c2p_writing[target_num] = False
+            else:
+                self.c2p_writing[target_num] = True
+                try:
+                    # on_c2p_done_write = partial(self.on_c2p_done_write_n, target_num=target_num)
+                    self.c2p_stream.write(data, callback=self.on_c2p_done_write)
+                except tornado.iostream.StreamClosedError:
+                    # Cancel the write, we will get on_close instead...
+                    self.c2p_writing[target_num] = False
 
     @logger(LoggerOptions.LOG_WRITE_OP)
     def _p2s_io_write_n(self, data, target_num):
@@ -487,14 +484,19 @@ class Session(object):
     ###########
     @logger(LoggerOptions.LOG_REMOVE_SESSION)
     def remove_session(self):
-        self.c2p_lock.acquire(timeout=600)
-        if (all([state == Session.State.CLOSED for state in self.p2s_state]) and
-            self.c2p_state == Session.State.CLOSED and
-            not self.session_removed):
+        lock_acquired = self.c2p_lock.acquire(timeout=600)
 
-            self.proxy.remove_session(self)
-            self.session_removed = True
-        self.c2p_lock.release()
+        try:
+            self.log('Lock acquired: %s Removing session' % lock_acquired)
+            if (all([state == Session.State.CLOSED for state in self.p2s_state]) and
+                self.c2p_state == Session.State.CLOSED and
+                not self.session_removed):
+
+                self.proxy.remove_session(self)
+                self.session_removed = True
+        finally:
+            if lock_acquired:
+                self.c2p_lock.release()
 
 class SessionFactory(object):
     """
